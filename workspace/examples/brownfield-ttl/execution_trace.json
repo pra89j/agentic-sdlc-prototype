@@ -1,0 +1,182 @@
+{
+  "requirement": "Add optional link expiration TTL in seconds and return 410 Gone when expired",
+  "workspace_path": "workspace\\examples\\brownfield-ttl",
+  "mock_mode": true,
+  "spec": {
+    "mode": "brownfield",
+    "problem_statement": "Add optional link expiration TTL in seconds and return 410 Gone when expired.",
+    "functional_requirements": [
+      "POST /shorten accepts an optional positive ttl_seconds value.",
+      "Persist expiration timestamps in UTC; links without a TTL never expire.",
+      "Expired links return HTTP 410 without incrementing click analytics.",
+      "Unknown links continue to return HTTP 404.",
+      "Existing link creation, redirects, aliases, and analytics remain compatible."
+    ],
+    "non_functional_requirements": [
+      "Migrate existing SQLite databases without losing URL mappings or click counts.",
+      "Validate the expiration behavior with deterministic API tests."
+    ],
+    "ambiguities_resolved": [
+      "TTL is optional and expressed in positive whole seconds.",
+      "Expiration is evaluated against UTC time; a link is expired at expires_at <= now.",
+      "Links with no TTL remain active indefinitely.",
+      "Expiration is checked before redirect click counts are incremented."
+    ]
+  },
+  "impact": {
+    "existing_files": [
+      "app/__init__.py",
+      "app/main.py",
+      "app/service.py",
+      "app/storage.py",
+      "docs/URL_SHORTENER_SCALABILITY.md",
+      "README.md",
+      "requirements.txt",
+      "tests/test_shortener.py"
+    ],
+    "impacted_modules": [
+      "app/storage.py",
+      "app/service.py",
+      "app/main.py",
+      "tests/test_shortener.py",
+      "README.md"
+    ],
+    "data_flow_summary": "Brownfield change to the existing FastAPI -> service -> SQLite path; a backward-compatible schema migration adds expires_at.",
+    "integration_risks": [
+      "Existing SQLite files need an additive migration that preserves rows.",
+      "Expired links must not increment clicks or be confused with unknown codes."
+    ]
+  },
+  "task_dag": {
+    "tasks": [
+      {
+        "id": "T1",
+        "title": "Backward-compatible Expiration Storage",
+        "category": "contract",
+        "dependencies": [],
+        "target_files": [
+          "app/storage.py"
+        ],
+        "acceptance_criteria": "Persist expires_at and migrate existing SQLite tables without losing rows."
+      },
+      {
+        "id": "T2",
+        "title": "TTL Service and API Behavior",
+        "category": "implementation",
+        "dependencies": [
+          "T1"
+        ],
+        "target_files": [
+          "app/service.py",
+          "app/main.py"
+        ],
+        "acceptance_criteria": "Accept positive optional ttl_seconds; return 410 for expired links, 404 for unknown links, and preserve analytics behavior."
+      },
+      {
+        "id": "T3",
+        "title": "TTL Regression Tests and Documentation",
+        "category": "test",
+        "dependencies": [
+          "T2"
+        ],
+        "target_files": [
+          "tests/test_shortener.py",
+          "README.md"
+        ],
+        "acceptance_criteria": "Test active, expired, unknown, and legacy-schema cases; document the optional TTL API."
+      }
+    ],
+    "execution_order": [
+      "T1",
+      "T2",
+      "T3"
+    ]
+  },
+  "code_bundle": {
+    "files": [
+      {
+        "path": "app/storage.py",
+        "content": "import os\nimport sqlite3\nfrom datetime import datetime, timezone\n\ndef get_db_path() -> str:\n    return os.getenv(\"SHORTENER_DB_PATH\", \"url_shortener.db\")\n\ndef init_db() -> None:\n    with sqlite3.connect(get_db_path()) as conn:\n        conn.execute(\n            \"CREATE TABLE IF NOT EXISTS urls (\"\n            \"code TEXT PRIMARY KEY, original_url TEXT NOT NULL, \"\n            \"created_at TEXT NOT NULL, clicks INTEGER NOT NULL DEFAULT 0, \"\n            \"expires_at TEXT)\"\n        )\n        columns = {\n            row[1] for row in conn.execute(\"PRAGMA table_info(urls)\").fetchall()\n        }\n        if \"expires_at\" not in columns:\n            conn.execute(\"ALTER TABLE urls ADD COLUMN expires_at TEXT\")\n        conn.commit()\n\ndef save_url(\n    code: str, original_url: str, expires_at: str | None = None\n) -> bool:\n    init_db()\n    try:\n        with sqlite3.connect(get_db_path()) as conn:\n            conn.execute(\n                \"INSERT INTO urls \"\n                \"(code, original_url, created_at, clicks, expires_at) \"\n                \"VALUES (?, ?, ?, 0, ?)\",\n                (\n                    code,\n                    original_url,\n                    datetime.now(timezone.utc).isoformat(),\n                    expires_at,\n                ),\n            )\n            conn.commit()\n        return True\n    except sqlite3.IntegrityError:\n        return False\n\ndef get_url_state_and_increment(\n    code: str, now: datetime | None = None\n) -> tuple[str | None, bool]:\n    init_db()\n    current_time = now or datetime.now(timezone.utc)\n    if current_time.tzinfo is None:\n        current_time = current_time.replace(tzinfo=timezone.utc)\n    current_time = current_time.astimezone(timezone.utc)\n\n    with sqlite3.connect(get_db_path()) as conn:\n        row = conn.execute(\n            \"SELECT original_url, expires_at FROM urls WHERE code = ?\", (code,)\n        ).fetchone()\n        if not row:\n            return None, False\n\n        if row[1]:\n            expires_at = datetime.fromisoformat(row[1])\n            if expires_at.tzinfo is None:\n                expires_at = expires_at.replace(tzinfo=timezone.utc)\n            if expires_at.astimezone(timezone.utc) <= current_time:\n                return None, True\n\n        conn.execute(\"UPDATE urls SET clicks = clicks + 1 WHERE code = ?\", (code,))\n        conn.commit()\n        return row[0], False\n\ndef get_url_and_increment(code: str) -> str | None:\n    url, _ = get_url_state_and_increment(code)\n    return url\n\ndef get_stats(code: str) -> dict | None:\n    init_db()\n    with sqlite3.connect(get_db_path()) as conn:\n        row = conn.execute(\n            \"SELECT code, original_url, created_at, clicks, expires_at \"\n            \"FROM urls WHERE code = ?\",\n            (code,),\n        ).fetchone()\n        if not row:\n            return None\n        return {\n            \"code\": row[0],\n            \"original_url\": row[1],\n            \"created_at\": row[2],\n            \"clicks\": row[3],\n            \"expires_at\": row[4],\n        }\n"
+      },
+      {
+        "path": "app/service.py",
+        "content": "import secrets\nimport string\nfrom datetime import datetime, timedelta, timezone\nfrom app.storage import (\n    get_stats,\n    get_url_state_and_increment,\n    save_url,\n)\n\nALPHABET = string.ascii_letters + string.digits\n\ndef generate_code(length: int = 6) -> str:\n    return \"\".join(secrets.choice(ALPHABET) for _ in range(length))\n\ndef create_short_url(\n    original_url: str,\n    custom_alias: str | None = None,\n    ttl_seconds: int | None = None,\n) -> str:\n    if ttl_seconds is not None and ttl_seconds <= 0:\n        raise ValueError(\"TTL must be a positive number of seconds.\")\n    expires_at = None\n    if ttl_seconds is not None:\n        expires_at = (\n            datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)\n        ).isoformat()\n\n    if custom_alias:\n        if not save_url(custom_alias, original_url, expires_at):\n            raise ValueError(\"Custom alias already exists.\")\n        return custom_alias\n    for _ in range(5):\n        code = generate_code()\n        if save_url(code, original_url, expires_at):\n            return code\n    raise RuntimeError(\"Failed to generate unique short code.\")\n\ndef resolve_short_url_state(code: str) -> tuple[str | None, bool]:\n    return get_url_state_and_increment(code)\n\ndef resolve_short_url(code: str) -> str | None:\n    url, _ = resolve_short_url_state(code)\n    return url\n\ndef fetch_url_stats(code: str) -> dict | None:\n    return get_stats(code)\n"
+      },
+      {
+        "path": "app/main.py",
+        "content": "from contextlib import asynccontextmanager\nfrom fastapi import FastAPI, HTTPException, Request\nfrom fastapi.responses import RedirectResponse\nfrom pydantic import BaseModel, Field, HttpUrl\nfrom app.service import (\n    create_short_url,\n    fetch_url_stats,\n    resolve_short_url_state,\n)\nfrom app.storage import init_db\n\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n    init_db()\n    yield\n\napp = FastAPI(\n    title=\"Agent-Generated URL Shortener\",\n    version=\"1.0.0\",\n    lifespan=lifespan,\n)\n\nclass ShortenRequest(BaseModel):\n    url: HttpUrl\n    custom_alias: str | None = Field(\n        default=None, min_length=3, max_length=20, pattern=\"^[a-zA-Z0-9_-]+$\"\n    )\n    ttl_seconds: int | None = Field(default=None, gt=0)\n\nclass ShortenResponse(BaseModel):\n    code: str\n    short_url: str\n    original_url: str\n\n@app.get(\"/health\")\ndef health() -> dict:\n    return {\"status\": \"ok\"}\n\n@app.post(\"/shorten\", response_model=ShortenResponse, status_code=201)\ndef shorten_url(payload: ShortenRequest, request: Request) -> ShortenResponse:\n    try:\n        code = create_short_url(\n            str(payload.url), payload.custom_alias, payload.ttl_seconds\n        )\n    except ValueError as exc:\n        raise HTTPException(status_code=409, detail=str(exc)) from exc\n    base = str(request.base_url).rstrip(\"/\")\n    return ShortenResponse(\n        code=code,\n        short_url=f\"{base}/{code}\",\n        original_url=str(payload.url),\n    )\n\n@app.get(\"/stats/{code}\")\ndef url_stats(code: str) -> dict:\n    stats = fetch_url_stats(code)\n    if not stats:\n        raise HTTPException(status_code=404, detail=\"Short URL not found\")\n    return stats\n\n@app.get(\"/{code}\")\ndef redirect_url(code: str) -> RedirectResponse:\n    original_url, expired = resolve_short_url_state(code)\n    if expired:\n        raise HTTPException(status_code=410, detail=\"Short URL has expired\")\n    if not original_url:\n        raise HTTPException(status_code=404, detail=\"Short URL not found\")\n    return RedirectResponse(url=original_url, status_code=307)\n"
+      },
+      {
+        "path": "tests/test_shortener.py",
+        "content": "import sqlite3\n\nimport pytest\nfrom app import service\nfrom app.main import app\nfrom app.storage import get_stats, init_db, save_url\nfrom fastapi.testclient import TestClient\n\n@pytest.fixture(autouse=True)\ndef isolated_db(tmp_path, monkeypatch):\n    db_file = tmp_path / \"test_urls.db\"\n    monkeypatch.setenv(\"SHORTENER_DB_PATH\", str(db_file))\n\nclient = TestClient(app)\n\ndef test_health_check():\n    response = client.get(\"/health\")\n    assert response.status_code == 200\n    assert response.json() == {\"status\": \"ok\"}\n\ndef test_shorten_redirect_and_analytics():\n    create_response = client.post(\n        \"/shorten\", json={\"url\": \"https://example.com\"}\n    )\n    assert create_response.status_code == 201\n    code = create_response.json()[\"code\"]\n    redirect_response = client.get(f\"/{code}\", follow_redirects=False)\n    assert redirect_response.status_code == 307\n    assert redirect_response.headers[\"location\"] == \"https://example.com/\"\n    stats_response = client.get(f\"/stats/{code}\")\n    assert stats_response.status_code == 200\n    assert stats_response.json()[\"original_url\"] == \"https://example.com/\"\n    assert stats_response.json()[\"created_at\"]\n    assert stats_response.json()[\"clicks\"] == 1\n\ndef test_create_short_url_retries_code_collisions(monkeypatch):\n    generated_codes = iter([\"duplicate\", \"available\"])\n    saved_codes = []\n    monkeypatch.setattr(\n        service, \"generate_code\", lambda: next(generated_codes)\n    )\n    monkeypatch.setattr(\n        service,\n        \"save_url\",\n        lambda code, url, expires_at=None: saved_codes.append(code)\n        or code == \"available\",\n    )\n    assert service.create_short_url(\"https://example.com/\") == \"available\"\n    assert saved_codes == [\"duplicate\", \"available\"]\n\ndef test_custom_alias_conflict():\n    first = client.post(\n        \"/shorten\",\n        json={\"url\": \"https://example.com\", \"custom_alias\": \"my-link\"},\n    )\n    assert first.status_code == 201\n    second = client.post(\n        \"/shorten\",\n        json={\"url\": \"https://example.com\", \"custom_alias\": \"my-link\"},\n    )\n    assert second.status_code == 409\n\ndef test_invalid_url_rejected():\n    response = client.post(\"/shorten\", json={\"url\": \"not-a-valid-url\"})\n    assert response.status_code == 422\n\ndef test_ttl_is_optional_and_persisted():\n    response = client.post(\n        \"/shorten\",\n        json={\"url\": \"https://example.com\", \"ttl_seconds\": 3600},\n    )\n    assert response.status_code == 201\n    stats = client.get(f\"/stats/{response.json()['code']}\").json()\n    assert stats[\"expires_at\"]\n\ndef test_non_positive_ttl_is_rejected():\n    response = client.post(\n        \"/shorten\",\n        json={\"url\": \"https://example.com\", \"ttl_seconds\": 0},\n    )\n    assert response.status_code == 422\n\ndef test_expired_link_returns_410_without_incrementing_clicks():\n    assert save_url(\n        \"expired\", \"https://example.com/\", \"2000-01-01T00:00:00+00:00\"\n    )\n    response = client.get(\"/expired\", follow_redirects=False)\n    assert response.status_code == 410\n    assert get_stats(\"expired\")[\"clicks\"] == 0\n\ndef test_unknown_link_remains_404():\n    response = client.get(\"/unknown\", follow_redirects=False)\n    assert response.status_code == 404\n\ndef test_legacy_database_schema_is_migrated(tmp_path, monkeypatch):\n    db_file = tmp_path / \"legacy.db\"\n    monkeypatch.setenv(\"SHORTENER_DB_PATH\", str(db_file))\n    with sqlite3.connect(db_file) as conn:\n        conn.execute(\n            \"CREATE TABLE urls (code TEXT PRIMARY KEY, \"\n            \"original_url TEXT NOT NULL, created_at TEXT NOT NULL, \"\n            \"clicks INTEGER NOT NULL DEFAULT 0)\"\n        )\n        conn.execute(\n            \"INSERT INTO urls VALUES (?, ?, ?, ?)\",\n            (\"legacy\", \"https://example.com/\", \"2025-01-01T00:00:00+00:00\", 3),\n        )\n    init_db()\n    stats = get_stats(\"legacy\")\n    assert stats[\"clicks\"] == 3\n    assert stats[\"expires_at\"] is None\n\n"
+      },
+      {
+        "path": "README.md",
+        "content": "# URL Shortener Service\n\nRunnable FastAPI + SQLite demo with short-link creation, redirects, click stats,\nand optional link expiration.\n\n## Run locally\n\n```powershell\npython -m pip install -r requirements.txt\npython -m uvicorn app.main:app --reload\n```\n\nOpen http://127.0.0.1:8000/docs. Run tests with `python -m pytest`.\n\n## API\n\n- `POST /shorten` accepts `url`, optional `custom_alias`, and optional positive\n  `ttl_seconds`.\n- `GET /{code}` returns a 307 redirect, increments clicks for active links,\n  returns 410 for expired links, and 404 for unknown links.\n- `GET /stats/{code}` returns the original URL, creation time, click count,\n  and optional `expires_at`.\n- `GET /health` checks service availability.\n\nExisting SQLite databases are migrated additively; links without an expiration\nremain active indefinitely.\n"
+      }
+    ],
+    "api_contract_summary": "POST /shorten, GET /{code}, GET /stats/{code}, GET /health",
+    "architecture_notes": "Dependency-wave task execution; runnable local FastAPI and SQLite demo, with scale-out architecture documented separately."
+  },
+  "validation_passed": true,
+  "validation_logs": "[RUFF EXIT 0]\nAll checks passed!\n\n[PYTEST EXIT 0]\n============================= test session starts =============================\nplatform win32 -- Python 3.12.10, pytest-9.2.0, pluggy-1.7.0 -- C:\\Users\\prave\\Documents\\EY\\.venv\\Scripts\\python.exe\ncachedir: .pytest_cache\nrootdir: C:\\Users\\prave\\Documents\\EY\\workspace\\examples\\brownfield-ttl\nplugins: anyio-4.16.0, langsmith-0.14.17\ncollecting ... collected 10 items\n\ntests/test_shortener.py::test_health_check PASSED                        [ 10%]\ntests/test_shortener.py::test_shorten_redirect_and_analytics PASSED      [ 20%]\ntests/test_shortener.py::test_create_short_url_retries_code_collisions PASSED [ 30%]\ntests/test_shortener.py::test_custom_alias_conflict PASSED               [ 40%]\ntests/test_shortener.py::test_invalid_url_rejected PASSED                [ 50%]\ntests/test_shortener.py::test_ttl_is_optional_and_persisted PASSED       [ 60%]\ntests/test_shortener.py::test_non_positive_ttl_is_rejected PASSED        [ 70%]\ntests/test_shortener.py::test_expired_link_returns_410_without_incrementing_clicks PASSED [ 80%]\ntests/test_shortener.py::test_unknown_link_remains_404 PASSED            [ 90%]\ntests/test_shortener.py::test_legacy_database_schema_is_migrated PASSED  [100%]\n\n============================= 10 passed in 0.55s ==============================",
+  "retry_count": 1,
+  "risk_report": {
+    "technical_risks": [
+      "The additive SQLite migration must remain compatible with existing URL rows.",
+      "Expiration timestamps depend on consistent UTC handling."
+    ],
+    "tradeoffs_made": [
+      "TTL is optional; links without expires_at remain active indefinitely.",
+      "An expired link returns 410 and does not count as a successful click."
+    ],
+    "failure_scenarios": [
+      "Unknown short code -> HTTP 404.",
+      "Expired short code -> HTTP 410.",
+      "Non-positive ttl_seconds -> HTTP 422 through request validation."
+    ],
+    "validation_strategy": "Ruff and pytest, including active, expired, unknown, and legacy-schema migration cases.",
+    "verification_status": "PASSED"
+  },
+  "auto_approve": false,
+  "approved": true,
+  "approval_source": "interactive",
+  "execution_log": [
+    {
+      "attempt": 1,
+      "wave": 1,
+      "task_id": "T1",
+      "title": "Backward-compatible Expiration Storage",
+      "status": "completed",
+      "executor": "mock-template",
+      "artifacts": [
+        "app/storage.py"
+      ]
+    },
+    {
+      "attempt": 1,
+      "wave": 2,
+      "task_id": "T2",
+      "title": "TTL Service and API Behavior",
+      "status": "completed",
+      "executor": "mock-template",
+      "artifacts": [
+        "app/service.py",
+        "app/main.py"
+      ]
+    },
+    {
+      "attempt": 1,
+      "wave": 3,
+      "task_id": "T3",
+      "title": "TTL Regression Tests and Documentation",
+      "status": "completed",
+      "executor": "mock-template",
+      "artifacts": [
+        "tests/test_shortener.py",
+        "README.md"
+      ]
+    }
+  ],
+  "workflow_status": "validated"
+}

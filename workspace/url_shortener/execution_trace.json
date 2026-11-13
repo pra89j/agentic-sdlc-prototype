@@ -1,0 +1,216 @@
+{
+  "requirement": "Build a scalable URL shortener service with APIs, persistence, and analytics",
+  "workspace_path": "workspace/url_shortener",
+  "mock_mode": true,
+  "spec": {
+    "mode": "brownfield",
+    "problem_statement": "Implement URL Shortener capability: Build a scalable URL shortener service with APIs, persistence, and analytics",
+    "functional_requirements": [
+      "POST /shorten accepts long URL and returns unique Base62 short code",
+      "GET /{code} redirects (307) to original URL and increments click counter",
+      "GET /stats/{code} returns metadata, creation timestamp, and click count",
+      "GET /health returns service status"
+    ],
+    "non_functional_requirements": [
+      "Persist URL mappings in local SQLite database for zero-setup portability",
+      "Validate URLs using Pydantic HttpUrl to prevent malformed redirects"
+    ],
+    "ambiguities_resolved": [
+      "Storage unspecified -> Selected SQLite (url_shortener.db) for runnable local demo",
+      "Short code length unspecified -> Selected 6-char random alphanumeric ID with collision retry",
+      "Redirect HTTP status unspecified -> Selected 307 Temporary Redirect for accurate analytics"
+    ]
+  },
+  "impact": {
+    "existing_files": [
+      "app/__init__.py",
+      "app/main.py",
+      "app/service.py",
+      "app/storage.py",
+      "docs/URL_SHORTENER_SCALABILITY.md",
+      "README.md",
+      "requirements.txt",
+      "tests/test_shortener.py"
+    ],
+    "impacted_modules": [
+      "app/__init__.py",
+      "app/main.py",
+      "app/service.py",
+      "app/storage.py",
+      "docs/URL_SHORTENER_SCALABILITY.md",
+      "README.md",
+      "requirements.txt",
+      "tests/test_shortener.py"
+    ],
+    "data_flow_summary": "Brownfield enhancement: extending existing FastAPI routes and SQLite schema.",
+    "integration_risks": [
+      "Maintain backward compatibility with existing SQLite columns."
+    ]
+  },
+  "task_dag": {
+    "tasks": [
+      {
+        "id": "T1",
+        "title": "Storage Layer",
+        "category": "contract",
+        "dependencies": [],
+        "target_files": [
+          "app/storage.py"
+        ],
+        "acceptance_criteria": "SQLite schema and CRUD."
+      },
+      {
+        "id": "T2",
+        "title": "API & Service",
+        "category": "implementation",
+        "dependencies": [
+          "T1"
+        ],
+        "target_files": [
+          "app/service.py",
+          "app/main.py",
+          "requirements.txt"
+        ],
+        "acceptance_criteria": "Endpoints working with documented installable dependencies."
+      },
+      {
+        "id": "T3",
+        "title": "Tests & Docs",
+        "category": "test",
+        "dependencies": [
+          "T2"
+        ],
+        "target_files": [
+          "tests/test_shortener.py",
+          "README.md"
+        ],
+        "acceptance_criteria": "Pytest and ruff pass."
+      },
+      {
+        "id": "T4",
+        "title": "Scale-out Design",
+        "category": "documentation",
+        "dependencies": [
+          "T2"
+        ],
+        "target_files": [
+          "docs/URL_SHORTENER_SCALABILITY.md"
+        ],
+        "acceptance_criteria": "Document scale-out architecture, trade-offs, and migration path."
+      }
+    ],
+    "execution_order": [
+      "T1",
+      "T2",
+      "T3",
+      "T4"
+    ]
+  },
+  "code_bundle": {
+    "files": [
+      {
+        "path": "app/storage.py",
+        "content": "import os\nimport sqlite3\nfrom datetime import datetime, timezone\n\ndef get_db_path() -> str:\n    return os.getenv('SHORTENER_DB_PATH', 'url_shortener.db')\n\ndef init_db() -> None:\n    with sqlite3.connect(get_db_path()) as conn:\n        conn.execute('CREATE TABLE IF NOT EXISTS urls (code TEXT PRIMARY KEY, original_url TEXT NOT NULL, created_at TEXT NOT NULL, clicks INTEGER NOT NULL DEFAULT 0)')\n        conn.commit()\n\ndef save_url(code: str, original_url: str) -> bool:\n    init_db()\n    try:\n        with sqlite3.connect(get_db_path()) as conn:\n            conn.execute('INSERT INTO urls (code, original_url, created_at, clicks) VALUES (?, ?, ?, 0)', (code, original_url, datetime.now(timezone.utc).isoformat()))\n            conn.commit()\n        return True\n    except sqlite3.IntegrityError:\n        return False\n\ndef get_url_and_increment(code: str) -> str | None:\n    init_db()\n    with sqlite3.connect(get_db_path()) as conn:\n        row = conn.execute('SELECT original_url FROM urls WHERE code = ?', (code,)).fetchone()\n        if not row:\n            return None\n        conn.execute('UPDATE urls SET clicks = clicks + 1 WHERE code = ?', (code,))\n        conn.commit()\n        return row[0]\n\ndef get_stats(code: str) -> dict | None:\n    init_db()\n    with sqlite3.connect(get_db_path()) as conn:\n        row = conn.execute('SELECT code, original_url, created_at, clicks FROM urls WHERE code = ?', (code,)).fetchone()\n        if not row:\n            return None\n        return {'code': row[0], 'original_url': row[1], 'created_at': row[2], 'clicks': row[3]}\n"
+      },
+      {
+        "path": "app/service.py",
+        "content": "import secrets\nimport string\nfrom app.storage import get_stats, get_url_and_increment, save_url\n\nALPHABET = string.ascii_letters + string.digits\n\ndef generate_code(length: int = 6) -> str:\n    return ''.join(secrets.choice(ALPHABET) for _ in range(length))\n\ndef create_short_url(original_url: str, custom_alias: str | None = None) -> str:\n    if custom_alias:\n        if not save_url(custom_alias, original_url):\n            raise ValueError('Custom alias already exists.')\n        return custom_alias\n    for _ in range(5):\n        code = generate_code()\n        if save_url(code, original_url):\n            return code\n    raise RuntimeError('Failed to generate unique short code.')\n\ndef resolve_short_url(code: str) -> str | None:\n    return get_url_and_increment(code)\n\ndef fetch_url_stats(code: str) -> dict | None:\n    return get_stats(code)\n"
+      },
+      {
+        "path": "app/main.py",
+        "content": "from contextlib import asynccontextmanager\nfrom fastapi import FastAPI, HTTPException, Request\nfrom fastapi.responses import RedirectResponse\nfrom pydantic import BaseModel, Field, HttpUrl\nfrom app.service import create_short_url, fetch_url_stats, resolve_short_url\nfrom app.storage import init_db\n\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n    init_db()\n    yield\n\napp = FastAPI(title='Agent-Generated URL Shortener', version='1.0.0', lifespan=lifespan)\n\nclass ShortenRequest(BaseModel):\n    url: HttpUrl\n    custom_alias: str | None = Field(default=None, min_length=3, max_length=20, pattern='^[a-zA-Z0-9_-]+$')\n\nclass ShortenResponse(BaseModel):\n    code: str\n    short_url: str\n    original_url: str\n\n@app.get('/health')\ndef health() -> dict:\n    return {'status': 'ok'}\n\n@app.post('/shorten', response_model=ShortenResponse, status_code=201)\ndef shorten_url(payload: ShortenRequest, request: Request) -> ShortenResponse:\n    try:\n        code = create_short_url(str(payload.url), payload.custom_alias)\n    except ValueError as exc:\n        raise HTTPException(status_code=409, detail=str(exc)) from exc\n    base = str(request.base_url).rstrip('/')\n    return ShortenResponse(code=code, short_url=f'{base}/{code}', original_url=str(payload.url))\n\n@app.get('/stats/{code}')\ndef url_stats(code: str) -> dict:\n    stats = fetch_url_stats(code)\n    if not stats:\n        raise HTTPException(status_code=404, detail='Short URL not found')\n    return stats\n\n@app.get('/{code}')\ndef redirect_url(code: str) -> RedirectResponse:\n    original_url = resolve_short_url(code)\n    if not original_url:\n        raise HTTPException(status_code=404, detail='Short URL not found')\n    return RedirectResponse(url=original_url, status_code=307)\n"
+      },
+      {
+        "path": "requirements.txt",
+        "content": "fastapi>=0.110,<1.0\nhttpx>=0.27,<1.0\npydantic>=2.6,<3.0\npytest>=8.0,<10.0\nuvicorn>=0.27,<1.0\n"
+      },
+      {
+        "path": "tests/test_shortener.py",
+        "content": "import pytest\nfrom app import service\nfrom fastapi.testclient import TestClient\nfrom app.main import app\n\n@pytest.fixture(autouse=True)\ndef isolated_db(tmp_path, monkeypatch):\n    db_file = tmp_path / 'test_urls.db'\n    monkeypatch.setenv('SHORTENER_DB_PATH', str(db_file))\n\nclient = TestClient(app)\n\ndef test_health_check():\n    res = client.get('/health')\n    assert res.status_code == 200\n    assert res.json() == {'status': 'ok'}\n\ndef test_shorten_redirect_and_analytics():\n    create_res = client.post('/shorten', json={'url': 'https://example.com'})\n    assert create_res.status_code == 201\n    code = create_res.json()['code']\n    redirect_res = client.get(f'/{code}', follow_redirects=False)\n    assert redirect_res.status_code == 307\n    assert redirect_res.headers['location'] == 'https://example.com/'\n    stats_res = client.get(f'/stats/{code}')\n    assert stats_res.status_code == 200\n    assert stats_res.json()['original_url'] == 'https://example.com/'\n    assert stats_res.json()['created_at']\n    assert stats_res.json()['clicks'] == 1\n\ndef test_create_short_url_retries_code_collisions(monkeypatch):\n    generated_codes = iter(['duplicate', 'available'])\n    saved_codes = []\n    monkeypatch.setattr(service, 'generate_code', lambda: next(generated_codes))\n    monkeypatch.setattr(service, 'save_url', lambda code, url: saved_codes.append(code) or code == 'available')\n    assert service.create_short_url('https://example.com/') == 'available'\n    assert saved_codes == ['duplicate', 'available']\n\ndef test_custom_alias_conflict():\n    res1 = client.post('/shorten', json={'url': 'https://example.com', 'custom_alias': 'my-link'})\n    assert res1.status_code == 201\n    res2 = client.post('/shorten', json={'url': 'https://example.com', 'custom_alias': 'my-link'})\n    assert res2.status_code == 409\n\ndef test_invalid_url_rejected():\n    res = client.post('/shorten', json={'url': 'not-a-valid-url'})\n    assert res.status_code == 422\n"
+      },
+      {
+        "path": "README.md",
+        "content": "# URL Shortener Service\n\nRunnable FastAPI + SQLite demo with short-link creation, redirects, and click stats.\n\nRequires Python 3.10 or newer.\n\n## Run locally\n\n```powershell\npython -m venv .venv\n.venv\\Scripts\\Activate.ps1\npython -m pip install -r requirements.txt\npython -m uvicorn app.main:app --reload\n```\n\nOpen http://127.0.0.1:8000/docs. Run tests from this directory with `python -m pytest`.\n\n## API\n\n- `POST /shorten` with `{\"url\":\"https://example.com\"}` creates a short link.\n- `GET /{code}` returns a 307 redirect and increments the click count.\n- `GET /stats/{code}` returns the original URL, creation time, and clicks.\n- `GET /health` checks service availability.\n\nThis SQLite backend is for local evaluation. Optional future scale-out notes in `docs/URL_SHORTENER_SCALABILITY.md` describe possible evolution, not a requirement for running this demo."
+      },
+      {
+        "path": "docs/URL_SHORTENER_SCALABILITY.md",
+        "content": "# Optional URL Shortener Scale-out Considerations\n\nThe generated app is a zero-setup SQLite reference implementation. The following notes are optional future evolution, not requirements for this runnable demo.\n\n## Target architecture\n\n- Run stateless FastAPI instances behind a load balancer; externalize configuration and secrets.\n- Store authoritative URL mappings and uniqueness constraints in PostgreSQL. Generate random Base62 codes and let a unique index arbitrate collisions; retry only on unique-key conflicts.\n- Use Redis as a cache-aside read-through layer for redirects, with bounded TTL and explicit invalidation on link changes. The database remains authoritative.\n- Publish click events asynchronously to a durable queue (for example Kafka or Azure Event Hubs). A consumer deduplicates by event ID and aggregates counts into a separate analytics store. Redirect latency must not wait on analytics aggregation.\n- Apply rate limits, request timeouts, health/readiness probes, structured logs, tracing, and metrics for cache hit rate, redirect latency, queue lag, and database saturation.\n\n## Consistency and failure behavior\n\nThe redirect lookup is strongly backed by the mapping store on cache miss. Analytics are eventually consistent; queue outages must be visible through lag/alerts and handled with bounded retries or a durable outbox. Define event retention and privacy policy before launch. Avoid silently dropping events or making a failed analytics write turn a valid redirect into an error.\n\n## Capacity and validation gates\n\nBenchmark read/write mix, p95/p99 redirect latency, cache hit rate, database connection limits, and queue throughput using representative load. Exercise cache eviction, database failover, queue backpressure, duplicate events, and recovery. No production load or failover test is claimed by this local prototype.\n\n## Migration path\n\nKeep API contracts stable; introduce a storage interface, migrate SQLite rows to PostgreSQL, dual-read/verify before cutover, then add Redis and asynchronous click ingestion behind feature flags. The runnable demo currently performs synchronous SQLite click increments."
+      }
+    ],
+    "api_contract_summary": "POST /shorten, GET /{code}, GET /stats/{code}, GET /health",
+    "architecture_notes": "Dependency-wave task execution; runnable local FastAPI and SQLite demo, with scale-out architecture documented separately."
+  },
+  "validation_passed": true,
+  "validation_logs": "[RUFF EXIT 0]\nAll checks passed!\n\n[PYTEST EXIT 0]\n============================= test session starts =============================\nplatform win32 -- Python 3.12.10, pytest-9.2.0, pluggy-1.7.0 -- C:\\Users\\prave\\Documents\\EY\\.venv\\Scripts\\python.exe\ncachedir: .pytest_cache\nrootdir: C:\\Users\\prave\\Documents\\EY\\workspace\\url_shortener\nplugins: anyio-4.16.0, langsmith-0.14.17\ncollecting ... collected 5 items\n\ntests/test_shortener.py::test_health_check PASSED                        [ 20%]\ntests/test_shortener.py::test_shorten_redirect_and_analytics PASSED      [ 40%]\ntests/test_shortener.py::test_create_short_url_retries_code_collisions PASSED [ 60%]\ntests/test_shortener.py::test_custom_alias_conflict PASSED               [ 80%]\ntests/test_shortener.py::test_invalid_url_rejected PASSED                [100%]\n\n============================== 5 passed in 0.41s ==============================",
+  "retry_count": 1,
+  "risk_report": {
+    "technical_risks": [
+      "SQLite is a single-node local-demo store and is not the scale-out persistence tier.",
+      "Short-code collisions become more likely as the keyspace grows; the database uniqueness constraint and retry loop are required.",
+      "Click counts in the local demo are synchronously updated and can contend under load."
+    ],
+    "tradeoffs_made": [
+      "SQLite is retained for zero-setup local execution; optional future evolution could use PostgreSQL, Redis, and an asynchronous event pipeline.",
+      "HTTP 307 is used to avoid permanent redirect caching bypassing click tracking."
+    ],
+    "failure_scenarios": [
+      "Invalid URL -> HTTP 422 via Pydantic.",
+      "Unknown code -> HTTP 404."
+    ],
+    "validation_strategy": "Ruff static analysis + pytest service unit tests and FastAPI TestClient integration tests.",
+    "verification_status": "PASSED"
+  },
+  "auto_approve": true,
+  "approved": true,
+  "approval_source": "command-line",
+  "execution_log": [
+    {
+      "attempt": 1,
+      "wave": 1,
+      "task_id": "T1",
+      "title": "Storage Layer",
+      "status": "completed",
+      "executor": "mock-template",
+      "artifacts": [
+        "app/storage.py"
+      ]
+    },
+    {
+      "attempt": 1,
+      "wave": 2,
+      "task_id": "T2",
+      "title": "API & Service",
+      "status": "completed",
+      "executor": "mock-template",
+      "artifacts": [
+        "app/service.py",
+        "app/main.py",
+        "requirements.txt"
+      ]
+    },
+    {
+      "attempt": 1,
+      "wave": 3,
+      "task_id": "T3",
+      "title": "Tests & Docs",
+      "status": "completed",
+      "executor": "mock-template",
+      "artifacts": [
+        "tests/test_shortener.py",
+        "README.md"
+      ]
+    },
+    {
+      "attempt": 1,
+      "wave": 3,
+      "task_id": "T4",
+      "title": "Scale-out Design",
+      "status": "completed",
+      "executor": "mock-template",
+      "artifacts": [
+        "docs/URL_SHORTENER_SCALABILITY.md"
+      ]
+    }
+  ],
+  "workflow_status": "validated"
+}
